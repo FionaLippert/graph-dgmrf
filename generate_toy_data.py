@@ -2,10 +2,15 @@ import torch
 import torch_geometric as ptg
 import torch.distributions as dists
 import numpy as np
+import scipy
 import networkx as nx
 import os
 import argparse
 import matplotlib.pyplot as plt
+from sksparse.cholmod import cholesky, analyze, analyze_AAt
+import torch_sparse
+
+from layers import chol
 
 import visualization as vis
 import constants
@@ -109,6 +114,10 @@ parser.add_argument("--dad_samples", type=int, default=1000,
 parser.add_argument("--dad_k_max", type=int, default=50,
         help="Maximum k to compute DAD trace for")
 
+# new options for Cholesky factor approach
+parser.add_argument("--compute_cholesky", type=int, default=1,
+        help="If sparsity pattern of the Cholesky factor should be computed")
+
 args = parser.parse_args()
 
 _ = torch.random.manual_seed(args.seed)
@@ -139,6 +148,64 @@ else:
     assert False, "Unknown graph algorithm"
 
 graph_pos = graph_transforms(point_data)
+
+# compute sparsity pattern of Cholesky factor
+if args.compute_cholesky:
+    #A = ptg.utils.to_scipy_sparse_matrix(graph_pos.edge_index) #.tocsc()
+    laplacian = ptg.utils.get_laplacian(graph_pos.edge_index)
+    laplacian = ptg.utils.to_scipy_sparse_matrix(*laplacian).tocsc()
+    print(f'number of non-zero entries in laplacian: {laplacian.nnz}')
+
+    eps = 0.00001 # small perturbation to prevent zero entries on diagonal
+    Q = laplacian + eps * scipy.sparse.eye(graph_pos.num_nodes, format='csc')
+
+    factor = cholesky(Q, use_long=False)#, mode='simplicial') # use analyse and inplace_cholesky if same graph is used multiple times
+    perm = factor.P() # fill-reducing permutation matrix
+    L = factor.L() # sparsity pattern of Cholesky factor
+    edge_index_L, edge_attr_L = ptg.utils.from_scipy_sparse_matrix(L)
+    print(f'number of non-zero entries in L: {L.nnz} ({L.nnz / laplacian.nnz:3.2f} times as much as original graph)')
+
+    factor = cholesky(Q, use_long=False, ordering_method='natural') # no permutation
+    Pn = factor.P()  # fill-reducing permutation matrix
+    Ln = factor.L()  # sparsity pattern of Cholesky factor
+    print(f'number of non-zero entries in Ln: {Ln.nnz} ({Ln.nnz / L.nnz:3.2f} times as much as L)')
+
+    Q_perm = Q[perm[:, np.newaxis], perm[:, np.newaxis]]
+
+    # TODO: apply permutation to all graph attributes (observations, gt_states, edge_index, edge_attr, covariates, ...)
+    # from then on, only work with the new ordering
+    graph_pos.edge_index, _ = ptg.utils.from_scipy_sparse_matrix(Q_perm)
+    graph_pos.pos = graph_pos.pos[perm]
+    graph_pos.degree = ptg.utils.degree(graph_pos.edge_index[0], num_nodes=graph_pos.num_nodes)
+    graph_pos.node_features = torch.cat([graph_pos.pos, graph_pos.degree.view(-1, 1)], dim=1)
+
+    adj_L = torch_sparse.tensor.from_scipy(L)
+    graph_pos.adj_L = adj_L
+
+    # add distances
+    graph_pos.edge_attr = torch.norm(graph_pos.pos[graph_pos.edge_index[0]] - graph_pos.pos[graph_pos.edge_index[1]],
+                                     p=2, dim=-1).view(-1, 1)
+
+
+    # test triangular solve
+    # TODO: test multiple rhs
+    solver = chol.TestSolve()
+    x = solver.triangular_solve(adj_L, torch.ones(graph_pos.num_nodes))
+
+    print(x)
+
+    print(f'reconstruction = {L @ x.view(-1, 1)}')
+
+    x = solver.triangular_solve(adj_L.t(), torch.ones(graph_pos.num_nodes), backward=1)
+
+    print(x)
+
+    print(f'reconstruction = {L.transpose() @ x.view(-1, 1)}')
+
+
+
+
+
 
 # Construct G, Q
 if args.dist_weight:
@@ -228,6 +295,8 @@ y_noise = args.noise_std*torch.randn(args.num_nodes,1)
 graph_y = graph_x.clone() # Deep copy of x (including mask)
 graph_y.x = graph_x.x + y_noise
 
+graph_y.obs_precision = 1./(args.noise_std**2) * graph_y.mask
+
 if args.plot:
     vis.plot_graph(graph_x, name="x", title="x", show=True)
     vis.plot_graph(graph_y, name="y", title="y", show=True)
@@ -303,6 +372,8 @@ if args.random_mask:
     full_ds_name += "_random"
 if args.dist_weight:
     full_ds_name += "_weighted"
+if args.compute_cholesky:
+    full_ds_name += "_cholesky"
 
 utils.save_graph_ds(to_save, args, full_ds_name)
 

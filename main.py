@@ -137,6 +137,11 @@ def main():
     if config["features"]:
         assert hasattr(graph_y, "features"), "No features found for dataset"
 
+    if hasattr(graph_y, "node_features"):
+        config["n_node_features"] = graph_y.node_features.size(1)
+    if hasattr(graph_y, "edge_attr"):
+        config["n_edge_features"] = graph_y.edge_attr.size(1)
+
     # Init wandb
     wandb_name = "{}-{}".format(config["dataset"],
                 time.strftime("%H-%M"))
